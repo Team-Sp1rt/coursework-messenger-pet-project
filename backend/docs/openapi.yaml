@@ -9,14 +9,26 @@ info:
     Поддерживаются только личные чаты между двумя
     пользователями.
 
-    HTTP API используется для поиска
-    пользователей, работы с чатами и загрузки истории сообщений.
+    HTTP API используется для регистрации, входа, обновления JWT,
+    поиска пользователей, работы с чатами и загрузки истории сообщений.
+    Команды и события сообщений описаны в backend/docs/websocket.md.
+
+    Целевые показатели (не подтверждены нагрузочным тестом): p95 чтений
+    до 300 мс, создания чата и обновления JWT до 500 мс, регистрации и
+    входа до 1000 мс при базовом пиковом профиле из README.
+
+    ErrorResponse описывает ошибки AppException из приложения.
+    Ошибки Spring Security и стандартной обработки запросов могут
+    возвращаться без этого JSON-тела. Профиль нагрузки и целевые
+    показатели производительности приведены в README.
 
 servers:
   - url: http://localhost:8080
     description: Локальный backend
 
 tags:
+  - name: Authentication
+    description: Регистрация, вход и продление доступа
   - name: Users
     description: Поиск пользователей
   - name: Chats
@@ -26,6 +38,101 @@ security:
   - bearerAuth: []
 
 paths:
+  /api/auth/register:
+    post:
+      tags:
+        - Authentication
+      summary: Зарегистрировать пользователя
+      operationId: registerUser
+      security: []
+      description: |
+        Создаёт аккаунт и профиль в одной транзакции и возвращает JWT.
+        login и username должны быть уникальны. Пароль хранится как BCrypt-хеш.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/Authenticated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: login или username уже занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                loginTaken:
+                  value:
+                    error: LOGIN_ALREADY_EXISTS
+                    message: A user with this login already exists
+                    status: 409
+                usernameTaken:
+                  value:
+                    error: USERNAME_ALREADY_EXISTS
+                    message: A user with this username already exists
+                    status: 409
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: Войти по логину и паролю
+      operationId: loginUser
+      security: []
+      description: |
+        Возвращает JWT и профиль пользователя.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthorisationRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/Authenticated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Неверный логин или пароль (ошибка приложения)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: INVALID_CREDENTIALS
+                message: Invalid credentials
+                status: 401
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/auth/refresh:
+    post:
+      tags:
+        - Authentication
+      summary: Выпустить новый access token
+      operationId: refreshAccessToken
+      description: |
+        Требуется действующий access token в Authorization: Bearer <token>.
+        Возвращается новый access token сроком на семь суток. Отдельного
+        refresh token нет; с просроченным access token нужно войти заново.
+        Тело запроса не требуется. Старый access token не отзывается.
+      responses:
+        '200':
+          description: Новый access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /api/users/search:
     get:
       tags:
@@ -60,6 +167,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserSearchResponse'
+        '404':
+          description: Пользователи с указанной подстрокой не найдены (NO_SUCH_USER)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -96,7 +211,7 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateChatRequest'
       responses:
-        '201':
+        '200':
           description: Чат создан
           content:
             application/json:
@@ -122,6 +237,7 @@ paths:
         Без параметра `beforeMessageId` возвращает последние сообщения чата.
         Для подгрузки более старых сообщений клиент передаёт
         `nextBeforeMessageId` из предыдущего ответа.
+
       operationId: getChatMessages
       parameters:
         - $ref: '#/components/parameters/ChatId'
@@ -152,10 +268,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
-          description: Чат не найден
+          description: Сообщение beforeMessageId не найдено
           content:
             application/json:
               schema:
@@ -179,37 +293,118 @@ components:
         $ref: '#/components/schemas/Id'
 
   responses:
-    BadRequest:
-      description: Запрос не прошёл валидацию
+    Authenticated:
+      description: JWT сроком на семь суток и профиль пользователя
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            code: VALIDATION_ERROR
-            message: Request validation failed
+            $ref: '#/components/schemas/AuthResponse'
+
+    BadRequest:
+      description: |
+        Некорректный запрос, JSON или параметры. Формат стандартной ошибки
+        Spring может отличаться от ErrorResponse.
 
     Unauthorized:
-      description: JWT отсутствует, недействителен или истёк
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            code: UNAUTHORIZED
-            message: Authentication is required
+      description: |
+        JWT отсутствует, недействителен или истёк. Ответ формируется
+        Spring Security; наличие JSON-тела ErrorResponse не гарантируется.
 
-    Forbidden:
-      description: Пользователь не является участником чата
+    InternalServerError:
+      description: Ошибка обращения к базе данных (DATABASE_ERROR)
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
           example:
-            code: CHAT_ACCESS_DENIED
-            message: You are not a member of this chat
+            error: DATABASE_ERROR
+            message: Database operation failed
+            status: 500
 
   schemas:
+    RegistrationRequest:
+      type: object
+      required:
+        - username
+        - login
+        - password
+      properties:
+        username:
+          type: string
+          description: Уникальное публичное имя; в БД VARCHAR(50)
+          example: alex
+        login:
+          type: string
+          description: Уникальный логин для входа; в БД VARCHAR(50)
+          example: alex_login
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          description: Пароль; сервер сохраняет BCrypt-хеш
+          example: example-password
+        birthday:
+          type: [string, 'null']
+          format: date
+          example: '2003-05-15'
+
+    AuthorisationRequest:
+      type: object
+      required:
+        - login
+        - password
+      properties:
+        login:
+          type: string
+          example: alex_login
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          example: example-password
+
+    User:
+      type: object
+      required:
+        - id
+        - username
+        - bio
+        - birthday
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        username:
+          type: string
+          example: alex
+        bio:
+          type: [string, 'null']
+          example: ''
+        birthday:
+          type: [string, 'null']
+          format: date
+          example: '2003-05-15'
+
+    AuthResponse:
+      type: object
+      required:
+        - token
+        - user
+      properties:
+        token:
+          type: string
+          description: Подписанный access JWT; sub содержит ID пользователя
+        user:
+          $ref: '#/components/schemas/User'
+
+    RefreshResponse:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          description: Новый access JWT
+
     Id:
       type: integer
       format: int64
@@ -339,10 +534,18 @@ components:
     ErrorResponse:
       type: object
       required:
-        - code
+        - error
         - message
+        - status
       properties:
-        code:
+        error:
           type: string
+          description: Код ошибки приложения
+          example: DATABASE_ERROR
         message:
           type: string
+        status:
+          type: integer
+          format: int32
+          description: HTTP-статус, совпадающий со статусом ответа
+          example: 500
